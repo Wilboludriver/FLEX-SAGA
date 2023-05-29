@@ -3,6 +3,7 @@ base_lr: 0.0005
 batch_size: 625
 best_cnet: 'flex/pretrained_models/ckpts/coarsenet.pt'
 best_rnet: 'flex/pretrained_models/ckpts/refinenet.pt'
+best_snet: 'saga/pretrained_model/male_grasppose_model.pt'
 bps_size: 4096
 cuda_id: 0
 expr_ID: 'V00'

@@ -3,3 +3,4 @@ data/**
 __pycache__
 .ipynb_checkpoints
 flex/pretrained_models/ckpts/**
+saga/pretrained_model/**

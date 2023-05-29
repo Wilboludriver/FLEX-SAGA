@@ -1,0 +1,38 @@
+
+CommandNotFoundError: Your shell has not been properly configured to use 'conda activate'.
+To initialize your shell, run
+
+    $ conda init <SHELL_NAME>
+
+Currently supported shells are:
+  - bash
+  - fish
+  - tcsh
+  - xonsh
+  - zsh
+  - powershell
+
+See 'conda init --help' for more information and options.
+
+IMPORTANT: You may need to close and restart your shell after running 'conda init'.
+
+
+2023-05-22 11:11:12,391 - root - INFO - [male] - Started training GrabNet, experiment code 2023-05-22 11:11:07
+2023-05-22 11:11:12,392 - root - INFO - tensorboard --logdir=logs/GraspPose/male/summaries
+2023-05-22 11:11:12,392 - root - INFO - Torch Version: 1.12.1+cu113
+
+2023-05-22 11:11:12,392 - root - INFO - Base dataset_dir is ./dataset/GraspPose
+2023-05-22 11:11:12,413 - root - INFO - Using 1 CUDA cores [NVIDIA GeForce RTX 2080 Ti] for training!
+2023-05-22 11:11:12,413 - root - INFO - {'batch_size': 64, 'n_workers': 8, 'use_multigpu': False, 'kl_coef': 0.5, 'dataset_dir': './dataset/GraspPose', 'base_dir': '/cluster/scratch/zhangzhen/SAGA', 'work_dir': 'logs/GraspPose/male', 'base_lr': 0.0005, 'best_net': None, 'gender': 'male_cvae', 'exp_name': 'male', 'pretrain': True, 'pretrain_dir': './pretrained_model/male_grasppose_model.pt', 'bps_size': 4096, 'c_weights_path': None, 'cuda_id': 0, 'latentD': 512, 'log_every_epoch': 10, 'n_epochs': 100, 'n_markers': 512, 'n_neurons': 512, 'reg_coef': 0.0005, 'seed': 4815, 'try_num': 0, 'vpe_path': None, 'load_on_ram': False, 'cond_object_height': True, 'motion_intent': False, 'object_class': ['all'], 'robustkl': False, 'kl_annealing': True, 'kl_annealing_epoch': 100, 'marker_weight': 1, 'foot_weight': 0, 'collision_weight': 0, 'consistency_weight': 1, 'dropout': 0.1, 'obj_feature': 12, 'pointnet_hc': 64, 'continue_train': False, 'data_representation': 'markers_143', 'default_cfg': {'base_lr': 0.0005, 'batch_size': 64, 'best_net': None, 'bps_size': 4096, 'c_weights_path': None, 'cuda_id': 0, 'dataset_dir': './dataset/GraspPose', 'kl_coef': 0.5, 'latentD': 512, 'log_every_epoch': 10, 'n_epochs': 100, 'n_markers': 512, 'n_neurons': 512, 'n_workers': 8, 'reg_coef': 0.0005, 'seed': 4815, 'try_num': 0, 'use_multigpu': False, 'vpe_path': None, 'work_dir': 'logs/GraspPose/male', 'load_on_ram': False, 'cond_object_height': True, 'motion_intent': False, 'object_class': ['all'], 'robustkl': False, 'kl_annealing': True, 'kl_annealing_epoch': 100, 'marker_weight': 1, 'foot_weight': 0, 'collision_weight': 0, 'consistency_weight': 1, 'dropout': 0.1, 'obj_feature': 12, 'pointnet_hc': 64, 'continue_train': False, 'data_representation': 'markers_143', 'base_dir': '/cluster/scratch/zhangzhen/SAGA', 'gender': 'male_cvae', 'exp_name': 'male', 'pretrain': True, 'pretrain_dir': './pretrained_model/male_grasppose_model.pt'}}
+Traceback (most recent call last):
+  File "train_grasppose.py", line 68, in <module>
+    grabpose_trainer = Trainer(cfg=cfg)
+  File "/cluster/scratch/zhangzhen/SAGA/WholeGraspPose/trainer.py", line 77, in __init__
+    self.load_data(cfg, inference)
+  File "/cluster/scratch/zhangzhen/SAGA/WholeGraspPose/trainer.py", line 137, in load_data
+    ds_train = LoadData(dataset_dir=cfg.dataset_dir, ds_name=ds_name, gender=cfg.gender, motion_intent=cfg.motion_intent, object_class=cfg.object_class)
+  File "/cluster/scratch/zhangzhen/SAGA/WholeGraspPose/data/dataloader.py", line 43, in __init__
+    self.ds = self.load_full_data(self.ds_path)
+  File "/cluster/scratch/zhangzhen/SAGA/WholeGraspPose/data/dataloader.py", line 64, in load_full_data
+    subsets = subsets_dict[self.gender]
+KeyError: 'male_cvae'

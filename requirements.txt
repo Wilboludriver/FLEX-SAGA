@@ -1,4 +1,4 @@
-numpy
+#numpy
 pillow
 tqdm
 trimesh
@@ -9,7 +9,7 @@ omegaconf
 protobuf==3.8
 smplx
 
-git+https://github.com/otaheri/chamfer_distance.git
-git+https://github.com/otaheri/MANO.git
+#git+https://github.com/otaheri/chamfer_distance.git
+#git+https://github.com/otaheri/MANO.git
 git+https://github.com/otaheri/bps_torch.git
 git+https://github.com/MPI-IS/mesh.git

@@ -8,6 +8,11 @@ from flex.tools.utils import recompose_angle
 from flex.tools.utils import euler_torch
 from flex.tools import pytorch_geometric
 
+#saga fitting part
+from saga.WholeGraspPose.models.fittingop_original import FittingOP
+import os
+import open3d as o3d
+
 from torch.nn import functional as F
 from bps_torch.bps import bps_torch
 from collections import Counter
@@ -27,13 +32,15 @@ class Losses(object):
         self,
         cfg,
         gan_body,
-        gan_rh
+        gan_rh,
+        object_info
     ):
         # Preliminaries.
         self.cfg = cfg
         self.device = 'cuda:'+str(cfg.cuda_id) if cfg.cuda_id != -1 else 'cpu'
         self.gan_body = gan_body
-        self.gan_rh_coarse, self.gan_rh_refine = gan_rh
+        # self.gan_rh_coarse, self.gan_rh_refine = gan_rh
+        self.gan_saga = gan_rh
 
         # Body model.
         self.sbj_m = smplx.create(model_path=cfg.smplx_dir,
@@ -43,13 +50,49 @@ class Losses(object):
                                   flat_hand_mean=True,
                                   batch_size=cfg.batch_size).to(self.device).eval()
         # Hand model.
-        self.rh_m = mano.load(model_path=cfg.mano_dir,
-                              is_right=True,
-                              model_type='mano',
-                              gender=cfg.gender,
-                              num_pca_comps=45,
-                              flat_hand_mean=True,
-                              batch_size=cfg.batch_size).to(self.device).eval()
+        # self.rh_m = mano.load(model_path=cfg.mano_dir,
+        #                       is_right=True,
+        #                       model_type='mano',
+        #                       gender=cfg.gender,
+        #                       num_pca_comps=45,
+        #                       flat_hand_mean=True,
+        #                       batch_size=cfg.batch_size).to(self.device).eval()
+        
+        # saga body model：
+        self.saga_body = smplx.create('../../data/smplx_models', model_type=type,
+                                gender=self.cfg.gender, ext='npz',
+                                num_pca_comps=24,
+                                create_global_orient=True,
+                                create_body_pose=True,
+                                create_betas=True,
+                                create_left_hand_pose=True,
+                                create_right_hand_pose=True,
+                                create_expression=True,
+                                create_jaw_pose=True,
+                                create_leye_pose=True,
+                                create_reye_pose=True,
+                                create_transl=True,
+                                batch_size=self.cfg.batch_size,
+                                v_template=None
+                                ).to(self.device)
+        
+        self.fittingcfg ={ 'init_lr_h': 0.008,
+                            'num_iter': [300,400,500],
+                            'batch_size': 1,
+                            'num_markers': 143,
+                            'device': self.device,
+                            'cfg': cfg,
+                            'verbose': False,
+                            'hand_ncomps': 24,
+                            'only_rec': False,     # True / False 
+                            'contact_loss': 'contact',  # contact / prior / False
+                            #'logger': logger,
+                            'data_type': 'markers_143',                        
+                            }
+        self.fittingop = FittingOP(self.fittingop)
+        self.obj_data = object_info
+        
+        
 
         # Misc.
         self.sbj_verts_region_map = np.load(self.cfg.sbj_verts_region_map_pth, allow_pickle=True)  # (10475,)
@@ -299,6 +342,40 @@ class Losses(object):
             obstacle_loss_batched_in /= len(extras['obstacles_info'])
             obstacle_loss_batched_out /= len(extras['obstacles_info'])
         return obstacle_loss_batched_in, obstacle_loss_batched_out
+    
+    def get_saga_obstacle_penet_loss(self, bm_output, extras):
+        """
+        Compute penetration loss between saga and all provided obstacle vertices.
+
+        :param bm_output                    (SMPLX body-model output)
+        :param extras                       (dict)         - keys ['o_verts', 'o_faces'] (stuff that is not optimized over and that can be copied over from GT and is necessary for loss computation)
+
+        :return obstacle_loss_batched_in   (torch.tensor) - (bs,)
+        :return obstacle_loss_batched_out  (torch.tensor) - (bs,)
+        """
+        # Preliminaries.
+        bs = self.cfg.batch_size
+
+        # Load subject vertices and faces.
+        bv = bm_output.vertices.reshape(bs,-1,3)                                                # (bs, 10475, 3)
+        bf = torch.LongTensor(self.sbj_m.faces.astype('float32')).to(self.device)               # (20908, 3)
+        if self.cfg.subsample_sbj:
+            bf = self.sbj_faces_simplified                                                      # (1269, 3)
+            bv = bv[:, self.sbj_verts_id, :]                                                    # (bs, 625, 3)
+            adjacency_matrix = self.adj_matrix_simplified
+        else:
+            adjacency_matrix = self.adj_matrix_original
+
+        # Compute loss for each obstacle.
+        obstacle_loss_batched_in, obstacle_loss_batched_out = torch.zeros(bs).to(self.device), torch.zeros(bs).to(self.device)
+        for obstacle in extras['obstacles_info']:
+            olb_in, olb_out = self.intersection(bv, obstacle['o_verts'][None].to(self.device), bf, obstacle['o_faces'].to(self.device), True, adjacency_matrix)
+            obstacle_loss_batched_in += olb_in
+            obstacle_loss_batched_out += olb_out
+        if len(extras['obstacles_info']):
+            obstacle_loss_batched_in /= len(extras['obstacles_info'])
+            obstacle_loss_batched_out /= len(extras['obstacles_info'])
+        return obstacle_loss_batched_in, obstacle_loss_batched_out
 
 
     def get_lowermost_loss(self, bm_output):
@@ -366,6 +443,187 @@ class Losses(object):
         # 4. Get angle using above steps.
         wrist_loss = torch.arccos(dot / (norm_rh * norm_bm))
         return wrist_loss
+    
+    def inference(self,w, n_rand_samples=1):
+        """ prepare test object data: [verts_object, feat_object(normal + rotmat), transf_transl] 
+        :params obj_data: dict, info about the object
+        :n_rand_samples: number of random samples generated per object
+        """
+        ### object centered
+        # for obj in grabpose.cfg.object_class:
+        self.obj_data['feat_object'] = self.obj_data['feat_object'].permute(0,2,1)
+        self.obj_data['verts_object'] = self.obj_data['verts_object'].permute(0,2,1)
+
+        n_samples_total = self.obj_data['feat_object'].shape[0]
+
+        markers_gen = []
+        object_contact_gen = []
+        markers_contact_gen = []
+        for i in range(n_samples_total):
+            sample_results = self.gan_saga.sample_from_w(w,self.obj_data['verts_object'][None, i].repeat(n_rand_samples,1,1), self.obj_data['feat_object'][None, i].repeat(n_rand_samples,1,1), self.obj_data['transf_transl'][None, i].repeat(n_rand_samples,1))
+            markers_gen.append((sample_results[0]+self.obj_data['transf_transl'][None, i]))
+            markers_contact_gen.append(sample_results[1])
+            object_contact_gen.append(sample_results[2])
+
+        markers_gen = torch.cat(markers_gen, dim=0)   # [B, N, 3]
+        object_contact_gen = torch.cat(object_contact_gen, dim=0).squeeze()   # [B, 2048]
+        markers_contact_gen = torch.cat(markers_contact_gen, dim=0)   # [B, N]
+
+        output = {}
+        output['markers_gen'] = markers_gen.detach().cpu().numpy()
+        output['markers_contact_gen'] = markers_contact_gen.detach().cpu().numpy()
+        output['object_contact_gen'] = object_contact_gen.detach().cpu().numpy()
+        output['normal_object'] = self.obj_data['normal_object']#.repeat(n_rand_samples, axis=0)
+        output['transf_transl'] = self.obj_data['transf_transl'].detach().cpu().numpy()#.repeat(n_rand_samples, axis=0)
+        output['global_orient_object'] = self.obj_data['global_orient'].detach().cpu().numpy()#.repeat(n_rand_samples, axis=0)
+        output['global_orient_object_rotmat'] = self.obj_data['global_orient_rotmat'].detach().cpu().numpy()#.repeat(n_rand_samples, axis=0)
+        output['verts_object'] = (self.obj_data['verts_object']+self.obj_data['transf_transl'].view(-1,3,1).repeat(1,1,2048)).permute(0, 2, 1).detach().cpu().numpy()#.repeat(n_rand_samples, axis=0)
+
+
+        return output
+    def fitting_data_save(save_data,
+              markers,
+              markers_fit,
+              smplxparams,
+              gender,
+              object_contact, body_contact,
+              object_name, verts_object, global_orient_object, transf_transl_object, 
+              extras):
+        # markers & markers_fit
+        save_data['markers'].append(markers)
+        save_data['markers_fit'].append(markers_fit)
+        # print('markers:', markers.shape)
+
+        # body params
+        for key in save_data['body'].keys():
+            # print(key, smplxparams[key].shape)
+            save_data['body'][key].append(smplxparams[key].detach().cpu().numpy())
+        # object name & object params
+        save_data['object_name'].append(object_name)
+        save_data['gender'].append(gender)
+        save_data['object']['transl'].append(transf_transl_object)
+        save_data['object']['global_orient'].append(global_orient_object)
+        save_data['object']['verts_object'].append(verts_object)
+
+        # contact
+        save_data['contact']['body'].append(body_contact)
+        save_data['contact']['object'].append(object_contact)
+
+        # obstacles
+        save_data['obstacle']['recept_idx'].append(extras['recept_idx'])
+        save_data['obstacle']['receptacle_name'].append(extras['receptacle_name'])
+
+
+
+    def pose_opt(self, samples_results, n_random_samples, obj, gender, save_dir, device, extras, save=False):
+        """
+        :params extras: dict, info about the obstacle
+        """
+        # prepare objects
+        n_samples = len(samples_results['verts_object'])
+        verts_object = torch.tensor(samples_results['verts_object'])[:n_samples].to(device)  # (n, 2048, 3)
+        normals_object = torch.tensor(samples_results['normal_object'])[:n_samples].to(device)  # (n, 2048, 3)
+        global_orients_object = torch.tensor(samples_results['global_orient_object'])[:n_samples].to(device)  # (n, 2048, 3)
+        transf_transl_object = torch.tensor(samples_results['transf_transl'])[:n_samples].to(device)  # (n, 2048, 3)
+
+        # prepare body markers
+        markers_gen = torch.tensor(samples_results['markers_gen']).to(device)  # (n*k, 143, 3)
+        object_contacts_gen = torch.tensor(samples_results['object_contact_gen']).view(markers_gen.shape[0], -1, 1).to(device)  #  (n, 2048, 1)
+        markers_contacts_gen = torch.tensor(samples_results['markers_contact_gen']).view(markers_gen.shape[0], -1, 1).to(device)   #  (n, 143, 1)
+
+        # print('Fitting {} {} samples for {} at the repreptacle {}...'.format(n_samples, cfg.gender, obj.upper(), extras['receptacle_name']))
+
+
+        if save==True:
+            save_data_gen = {}
+            for data in [save_data_gen]:
+                data['markers'] = []
+                data['markers_fit'] = []
+                data['body'] = {}
+                for key in ['betas', 'transl', 'global_orient', 'body_pose', 'leye_pose', 'reye_pose', 'left_hand_pose', 'right_hand_pose']:
+                    data['body'][key] = []
+                data['object'] = {}
+                for key in ['transl', 'global_orient', 'verts_object']:
+                    data['object'][key] = []
+                data['contact'] = {}
+                for key in ['body', 'object']:
+                    data['contact'][key] = []
+                data['gender'] = []
+                data['object_name'] = []
+                
+                data['obstacle'] = {}
+                for key in ['recept_idx', 'receptacle_name']:
+                    data['obstacle'][key] = []
+
+
+        for i in tqdm(range(n_samples)):
+            # prepare object 
+            vert_object = verts_object[None, i, :, :]
+            normal_object = normals_object[None, i, :, :]
+
+            marker_gen = markers_gen[i*n_random_samples:(i+1)*n_random_samples, :, :]
+            object_contact_gen = object_contacts_gen[i*n_random_samples:(i+1)*n_random_samples, :, :]
+            markers_contact_gen = markers_contacts_gen[i*n_random_samples:(i+1)*n_random_samples, :, :]
+
+            for k in range(n_random_samples):
+                print('Fitting for {}-th GEN...'.format(k+1))
+                markers_fit_gen, smplxparams_gen, loss_gen = self.fittingop.fitting(marker_gen[None, k, :], object_contact_gen[None, k, :], markers_contact_gen[None, k], vert_object, normal_object, gender, extras)
+                
+                
+                if save == True:
+                    self.fitting_data_save(save_data_gen,
+                                marker_gen[k, :].detach().cpu().numpy().reshape(1, -1 ,3),
+                                markers_fit_gen[-1].squeeze().reshape(1, -1 ,3),
+                                smplxparams_gen[-1],
+                                gender,
+                                object_contact_gen[k].detach().cpu().numpy().reshape(1, -1), markers_contact_gen[k].detach().cpu().numpy().reshape(1, -1),
+                                obj, vert_object.detach().cpu().numpy(), global_orients_object[i].detach().cpu().numpy(), transf_transl_object[i].detach().cpu().numpy(),
+                                extras)
+
+       
+                        
+        if save == True:
+            for data in [save_data_gen]:
+                # for data in [save_data_gt, save_data_rec, save_data_gen]:
+                    data['markers'] = np.vstack(data['markers'])  
+                    data['markers_fit'] = np.vstack(data['markers_fit'])
+                    for key in ['betas', 'transl', 'global_orient', 'body_pose', 'leye_pose', 'reye_pose', 'left_hand_pose', 'right_hand_pose']:
+                        data['body'][key] = np.vstack(data['body'][key])
+                    for key in ['transl', 'global_orient', 'verts_object']:
+                        data['object'][key] = np.vstack(data['object'][key])
+                    for key in ['body', 'object']:
+                        data['contact'][key] = np.vstack(data['contact'][key])
+                    for key in ['recept_idx', 'receptacle_name']:
+                        data['obstacle'][key] = np.vstack(data['obstacle'][key])
+        
+    
+            np.savez(os.path.join(save_dir, 'fitting_results.npz'), **save_data_gen)
+
+        ##get body mesh
+       
+
+        # for key in smplxparams_gen[-1].keys():
+        #     # print(key, smplxparams[key].shape)
+        #     smplxparams[key] = torch.tensor(smplxparams[key][:n_samples]).to(device)
+
+        smplx_results = self.saga_body(return_verts=True, **smplxparams_gen[-1])
+        verts = smplx_results.vertices
+        face = self.saga_body.faces
+
+        
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(verts[0])   #TODO 确定verts是否为list
+        mesh.triangles = o3d.utility.Vector3iVector(face)
+        mesh.compute_vertex_normals()
+        
+        #mesh.paint_uniform_color(color_hex2rgb(color))   # orange
+         
+
+        return mesh
+    
+        
+        
+    
 
 
     def gan_loss(self, z, transl, global_orient, w, a, extras={}, alpha_lowermost=0.0, alpha_rh_match=1.0,
@@ -398,14 +656,29 @@ class Losses(object):
         else:  #'ypr'
             # yaw, pitch, roll = global_orient
             global_orient = recompose_angle(global_orient1, global_orient2, global_orient3, 'aa')
+        
+        #TODO
+        # (*)recunstruct saga body
+        samples_results = self.inference(self.obj_data, 1)
+        saga_mesh = self.pose_opt( samples_results, 1, self.obj_data['obj_name'], 
+                               self.cfg.gender, '', self.device, extras ,save=False)
+    
+    
+
+        
+        
 
         # (*) Joint loss.
         rh_match_loss, bm_output, rv, rf = self.get_rh_match_loss(z, transl, global_orient, w, a, extras)
 
         # (*) RHand-obstacle(s) penetration loss.
-        rh_obstacle_loss_in = rh_obstacle_loss_out = torch.zeros_like(rh_match_loss)
-        if alpha_rh_obstacle_in + alpha_rh_obstacle_out > 0:
-            rh_obstacle_loss_in, rh_obstacle_loss_out = self.get_rh_obstacle_penet_loss(rv, rf, extras)
+        # rh_obstacle_loss_in = rh_obstacle_loss_out = torch.zeros_like(rh_match_loss)
+        # if alpha_rh_obstacle_in + alpha_rh_obstacle_out > 0:
+        #     rh_obstacle_loss_in, rh_obstacle_loss_out = self.get_rh_obstacle_penet_loss(rv, rf, extras)
+            
+        saga_obstacle_loss_in = saga_obstacle_loss_out = torch.zeros_like(rh_match_loss)
+        if alpha_obstacle_in + alpha_obstacle_out > 0:
+            saga_obstacle_loss_in, saga_obstacle_loss_out = self.get_obstacle_penet_loss(bm_output, extras)
 
         # (*) Human-obstacle(s) penetration loss.
         obstacle_loss_in = obstacle_loss_out = torch.zeros_like(rh_match_loss)
@@ -417,30 +690,34 @@ class Losses(object):
         if alpha_lowermost > 0:
             lowermost_loss = self.get_lowermost_loss(bm_output)
 
-        # (*) Gaze Loss.
+        # (*) Gaze Loss. #TODO based on vposer
         gaze_loss = torch.zeros_like(rh_match_loss)
         if alpha_gaze > 0:
             gaze_loss = self.get_gaze_loss(bm_output, extras)
 
-        # (*) Wrist Loss.
-        wrist_loss = torch.zeros_like(rh_match_loss)
-        if alpha_wrist > 0:
-            wrist_loss = self.get_wrist_loss(bm_output, rv)
+        # # (*) Wrist Loss.
+        # wrist_loss = torch.zeros_like(rh_match_loss)
+        # if alpha_wrist > 0:
+        #     wrist_loss = self.get_wrist_loss(bm_output, rv)
 
         # Total loss.
-        total_loss = lowermost_loss * alpha_lowermost + rh_match_loss * alpha_rh_match + \
-                     obstacle_loss_in * alpha_obstacle_in + obstacle_loss_out * alpha_obstacle_out + \
-                     rh_obstacle_loss_in * alpha_rh_obstacle_in + rh_obstacle_loss_out * alpha_rh_obstacle_out + \
-                     gaze_loss * alpha_gaze + wrist_loss * alpha_wrist
+        # total_loss = lowermost_loss * alpha_lowermost + rh_match_loss * alpha_rh_match + \
+        #              obstacle_loss_in * alpha_obstacle_in + obstacle_loss_out * alpha_obstacle_out + \
+        #              rh_obstacle_loss_in * alpha_rh_obstacle_in + rh_obstacle_loss_out * alpha_rh_obstacle_out + \
+        #              gaze_loss * alpha_gaze + wrist_loss * alpha_wrist
+        total_loss = lowermost_loss * alpha_lowermost  + \
+                obstacle_loss_in * alpha_obstacle_in + obstacle_loss_out * alpha_obstacle_out + \
+                saga_obstacle_loss_in * alpha_rh_obstacle_in + saga_obstacle_loss_out * alpha_rh_obstacle_out + \
+                gaze_loss * alpha_gaze 
         loss_dict = {'total': total_loss,
                      'lowermost_loss': lowermost_loss,
                      'rh_match_loss': rh_match_loss,
                      'obstacle_loss_in': obstacle_loss_in,
                      'obstacle_loss_out': obstacle_loss_out,
                      'gaze_loss': gaze_loss,
-                     'wrist_loss': wrist_loss,
-                     'rh_obstacle_loss_in': rh_obstacle_loss_in,
-                     'rh_obstacle_loss_out': rh_obstacle_loss_out,
+                     #'wrist_loss': wrist_loss,
+                     'rh_obstacle_loss_in': saga_obstacle_loss_in,
+                     'rh_obstacle_loss_out': saga_obstacle_loss_out,
                     }
 
         return loss_dict
@@ -457,6 +734,7 @@ class FLEX(nn.Module):
         a_init,
         gan_body,
         gan_rh,
+        object_info,
         task='',
         extras={},
         requires_grad=True
@@ -465,7 +743,7 @@ class FLEX(nn.Module):
         self.cfg = cfg
         self.bs = z_init.shape[0]
         self.device = 'cuda:'+str(cfg.cuda_id) if cfg.cuda_id != -1 else 'cpu'
-        self.losses = Losses(cfg, gan_body, gan_rh)
+        self.losses = Losses(cfg, gan_body, gan_rh,object_info)
         self.gan_body = gan_body
         self.gan_rh_coarse, self.gan_rh_refine = gan_rh
         self.task = task
@@ -501,13 +779,16 @@ class FLEX(nn.Module):
         self.global_orient3 = nn.Parameter(
             global_orient_param_init[:, 2], requires_grad=requires_grad
         )
-
+        
+        #TODO replace the W latent for grabnet with the saga full body 
         # (4) W for Hand Pose + Translation + Global orientation.
         w_param_init = w_init.detach().clone()
         self.w = nn.Parameter(
             w_param_init, requires_grad=requires_grad
         )
 
+        
+        #TODO angle作用？ 用于body？
         # (5) Angle for Object Pose for Hand Grasping.
         a_param_init = a_init.detach().clone()
         self.angle = nn.Parameter(
@@ -616,7 +897,7 @@ class FLEX(nn.Module):
         return dout
 
 
-    def forward(self, mode=None, alpha_lowermost=0.0, alpha_rh_match=1.0, alpha_obstacle_in=0.0, alpha_obstacle_out=0.0, alpha_gaze=0.0, alpha_rh_obstacle_in=0.0, alpha_rh_obstacle_out=0.0, alpha_wrist=0.0):
+    def forward(self, mode=None, alpha_lowermost=0.0, alpha_rh_match=1.0, alpha_obstacle_in=0.0, alpha_obstacle_out=0.0, alpha_gaze=0.0, alpha_rh_obstacle_in=0.0, alpha_rh_obstacle_out=0.0, alpha_wrist=0.0, ):
         """
         :param mode    (str)                -- str indicating which step of n-part optimization is happening - e.g., 'tgz,w'
         :return loss   (torch.Tensor item)  -- for whichever mode is selected
@@ -811,11 +1092,13 @@ def optimize_findz(
     a_init,
     gan_body,
     gan_rh,
+    object_info,
     num_iterations=400,
     display=True,
     task='',
     extras={},
-    model_name='flex'
+    model_name='flex',
+    
 ):
     """
     Given object pose + trained VPoser prior + trained GrabNet prior,
@@ -830,7 +1113,7 @@ def optimize_findz(
     :param z_init                   Tensor on device (b, 32)
     :param transl_init              Tensor on device (b, 3)
     :param global_orient_init       Tensor on device (b, 3) -- could be either (yaw/pitch/roll) or 3 axis-angle components.
-    :param w_init                   Tensor on device (b, 16)
+    :param w_init                   Tensor on device (b, 16)   #TODO saga 16d latent
     :param a_init                   Tensor on device (b, 3)
     :param gan_body                 instance of VPoser model
     :param gan_rh                   list of right-hand grasping model [CoarseNet, RefineNet]
@@ -857,7 +1140,8 @@ def optimize_findz(
         gan_body=gan_body,
         gan_rh=gan_rh,
         task=task,
-        extras=extras
+        extras=extras,
+        object_info = object_info
     )
 
     # Setup optimizer.
@@ -893,7 +1177,7 @@ def optimize_findz(
                       'obstacle_loss_in': torch.zeros(bs).to(device),
                       'obstacle_loss_out': torch.zeros(bs).to(device),
                       'gaze_loss': torch.zeros(bs).to(device),
-                      'wrist_loss': torch.zeros(bs).to(device),
+                      #'wrist_loss': torch.zeros(bs).to(device),
                       'rh_obstacle_loss_in': torch.zeros(bs).to(device),
                       'rh_obstacle_loss_out': torch.zeros(bs).to(device)}
     # Stage specific.
@@ -940,6 +1224,7 @@ def optimize_findz(
                                     alpha_wrist=cfg.alpha_wrist,
                                     prediction_scale=cfg.prediction_scale,
                                     gradient_scale=cfg.gradient_scale,
+                                    obj_info =object_info
                                     )
                 curr_loss_batched = loss_dict['total']
                 curr_loss = curr_loss_batched.mean()
