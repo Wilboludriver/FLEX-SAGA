@@ -234,14 +234,14 @@ class FittingOP:
 
         ############################################################################################################
         # from flex: calculate the human mesh & obstacle mesh penetration loss
-        # alpha_obstacle_in=self.cfg.alpha_obstacle_in
-        # alpha_obstacle_out=self.cfg.alpha_obstacle_out
-        # loss_obstacle_in = loss_obstacle_out = 0
-        # if alpha_obstacle_in + alpha_obstacle_out > 0:
-        #     loss_obstacle_in, loss_obstacle_out = self.get_obstacle_penet_loss(mesh, extras)
-        #     loss_obstacle_in = alpha_obstacle_in * torch.mean(loss_obstacle_in) # avgerage over bs
-        #     loss_obstacle_out = alpha_obstacle_out * torch.mean(loss_obstacle_out) # avgerage over bs
-        # # print(f"final losss shape: loss_obstacle_in =  {loss_obstacle_in}, loss_obstacle_out = {loss_obstacle_out}")
+        alpha_obstacle_in=self.cfg.alpha_obstacle_in
+        alpha_obstacle_out=self.cfg.alpha_obstacle_out
+        loss_obstacle_in = loss_obstacle_out = 0
+        if alpha_obstacle_in + alpha_obstacle_out > 0:
+            loss_obstacle_in, loss_obstacle_out = self.get_obstacle_penet_loss(mesh, extras)
+            loss_obstacle_in = alpha_obstacle_in * torch.mean(loss_obstacle_in) # avgerage over bs
+            loss_obstacle_out = alpha_obstacle_out * torch.mean(loss_obstacle_out) # avgerage over bs
+        # print(f"final losss shape: loss_obstacle_in =  {loss_obstacle_in}, loss_obstacle_out = {loss_obstacle_out}")
         
         ############################################################################################################
         loss = (1 * loss_rec
